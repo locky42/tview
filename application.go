@@ -14,6 +14,9 @@ const (
 
 	// The minimum time between two consecutive redraws.
 	redrawPause = 50 * time.Millisecond
+
+	// The default block size for certain operations.
+	blockSize = 50
 )
 
 // DoubleClickInterval specifies the maximum time between clicks to register a
@@ -441,12 +444,8 @@ EventLoop:
                 if event == originalEvent {
                     if event.Key() == tcell.KeyUp {
                         currentScrollY--
-                        a.draw()
-                        break // Prevent the event from bubbling up to focus management.
                     } else if event.Key() == tcell.KeyDown {
                         currentScrollY++
-                        a.draw()
-                        break // Prevent the event from bubbling up to focus management.
                     }
                 }
 
@@ -457,6 +456,54 @@ EventLoop:
                             a.SetFocus(p)
                         })
                         draw = true
+                    }
+                }
+
+                // AUTO-SCROLL TO FOCUSED ELEMENT
+                if root != nil && a.screen != nil {
+                    if focused := a.GetFocus(); focused != nil {
+                        _, elemY, _, elemHeight := focused.GetRect()
+                        
+                        // Calculate layout paging constraints based on the virtual block size
+                        currentBlock := currentScrollY / blockSize
+
+                        // Handle specialized scrolling logic for tview.List components
+                        if list, ok := focused.(*List); ok {
+                            currentItem := list.GetCurrentItem()
+                            
+                            // If scrolled back to the very first item, reset the viewport to the absolute top
+                            // to ensure headers, titles, and top borders are fully visible.
+                            if currentItem == 0 {
+                                if currentScrollY != 0 {
+                                    currentScrollY = 0
+                                    draw = true
+                                }
+                            } else {
+                                // Calculate the precise Y coordinate for the currently active list row
+                                itemHeight := 1
+                                elemY = elemY + (currentItem * itemHeight)
+                                elemHeight = itemHeight
+                            }
+                        }
+
+                        // Evaluate viewport boundaries and adjust scroll offset if the element is out of bounds
+                        if elemHeight > 0 && currentScrollY != 0 {
+                            _, height := a.screen.Size()
+                            
+                            // Map local primitive coordinates to the global virtual scroll coordinate system
+                            globalElemY := elemY + (currentBlock * blockSize)
+                            globalElemBottom := globalElemY + elemHeight
+
+                            // Adjust viewport upwards if the focused element is above the visible area
+                            if globalElemY < currentScrollY {
+                                currentScrollY = globalElemY
+                                draw = true
+                            // Adjust viewport downwards if the focused element is below the visible area
+                            } else if globalElemBottom > currentScrollY + height { 
+                                currentScrollY = globalElemBottom - height
+                                draw = true
+                            }
+                        }
                     }
                 }
 
@@ -744,7 +791,6 @@ func (a *Application) draw() *Application {
 	width, height := screen.Size()
 
 	// Virtual scrolling configuration using a block-based (paging) approach.
-	blockSize := 50
 	currentBlock := currentScrollY / blockSize
 	virtualHeight := blockSize * 2
 
