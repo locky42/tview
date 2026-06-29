@@ -437,15 +437,16 @@ EventLoop:
                     break
                 }
 
+                // Intercept arrow keys for custom virtual scrolling before they reach the widget handler.
                 if event == originalEvent {
                     if event.Key() == tcell.KeyUp {
                         currentScrollY--
                         a.draw()
-                        break
+                        break // Prevent the event from bubbling up to focus management.
                     } else if event.Key() == tcell.KeyDown {
                         currentScrollY++
                         a.draw()
-                        break
+                        break // Prevent the event from bubbling up to focus management.
                     }
                 }
 
@@ -724,134 +725,150 @@ func (a *Application) ForceDraw() *Application {
 	return a.draw()
 }
 
+// draw actually does what Draw() promises to do.
 func (a *Application) draw() *Application {
-    a.Lock()
-    defer a.Unlock()
+	a.Lock()
+	defer a.Unlock()
 
-    screen := a.screen
-    root := a.root
-    fullscreen := a.rootFullscreen
-    before := a.beforeDraw
-    after := a.afterDraw
+	screen := a.screen
+	root := a.root
+	fullscreen := a.rootFullscreen
+	before := a.beforeDraw
+	after := a.afterDraw
 
-    if screen == nil || root == nil {
-        return a
-    }
+	if screen == nil || root == nil {
+		return a
+	}
 
-    width, height := screen.Size()
+	// Get the physical dimensions of the terminal window.
+	width, height := screen.Size()
 
-    virtualHeight := height
-    if virtualHeight < 60 { 
-        virtualHeight = 60
-    }
+	// Virtual scrolling configuration using a block-based (paging) approach.
+	blockSize := 50
+	currentBlock := currentScrollY / blockSize
+	virtualHeight := blockSize * 2
 
-    if ext, ok := root.(interface{ GetItemCount() int }); ok {
-        virtualHeight = ext.GetItemCount() * 10
-    } else if form, ok := root.(interface{ GetFormItemCount() int }); ok {
-        virtualHeight = 10 + (form.GetFormItemCount() * 3)
-    }
+	// Ensure the virtual buffer is at least as tall as the physical screen.
+	if virtualHeight < height {
+		virtualHeight = height
+	}
 
-    if virtualHeight < 150 {
-        virtualHeight = 150
-    }
+	// Initialize a lightweight simulation screen in memory for layout analysis.
+	simScreen := tcell.NewSimulationScreen("")
+	simScreen.Init()
+	simScreen.SetSize(width, virtualHeight)
+	simScreen.Clear()
 
-    simScreen := tcell.NewSimulationScreen("")
-    simScreen.Init()
-    simScreen.SetSize(width, virtualHeight)
-    simScreen.Clear()
+	// Perform a preliminary draw to detect the actual boundaries of the content.
+	if fullscreen {
+		root.SetRect(0, 0, width, virtualHeight)
+	}
+	root.Draw(simScreen)
 
-    if fullscreen {
-        root.SetRect(0, 0, width, virtualHeight)
-    }
-    root.Draw(simScreen)
+	vHeight := 0
+	_, _, defaultStyle, _ := simScreen.GetContent(0, virtualHeight-1)
 
-    vHeight := 0
-    _, _, defaultStyle, _ := simScreen.GetContent(0, virtualHeight-1)
+	// Scan the simulation screen from bottom to top to find the last rendered row.
+	for cy := virtualHeight - 1; cy >= 0; cy-- {
+		rowHasContent := false
+		for cx := 0; cx < width; cx++ {
+			mainc, _, style, _ := simScreen.GetContent(cx, cy)
+			// Identify non-empty cells that contain text, controls, or custom styling.
+			if mainc != 0 && mainc != ' ' && mainc != 0x20 && style != defaultStyle {
+				rowHasContent = true
+				break
+			}
+		}
+		if rowHasContent {
+			vHeight = cy + 1 // Fix the content's bottom boundary.
+			break
+		}
+	}
 
-    for cy := virtualHeight - 1; cy >= 0; cy-- {
-        rowHasContent := false
-        for cx := 0; cx < width; cx++ {
-            mainc, _, style, _ := simScreen.GetContent(cx, cy)
-            if mainc != 0 && mainc != ' ' && mainc != 0x20 && style != defaultStyle {
-                rowHasContent = true
-                break
-            }
-        }
-        if rowHasContent {
-            vHeight = cy + 1
-            break
-        }
-    }
+	// Add padding to safely accommodate the component's bottom border.
+	vHeight += 2
 
-    if vHeight <= 0 {
-        vHeight = height
-    }
+	// Adaptive sizing: stretch to full screen if the content is small, 
+	// otherwise clamp it within the current virtual block constraints.
+	if vHeight < height {
+		vHeight = height
+	}
+	if vHeight > virtualHeight {
+		vHeight = virtualHeight
+	}
 
-    vHeight += 2
+	// Re-render the root element inside the perfectly sized container 
+	// to snap the bottom borders directly beneath the content.
+	if fullscreen {
+		root.SetRect(0, 0, width, vHeight)
+	}
+	simScreen.Clear()
+	root.Draw(simScreen)
 
-    if vHeight <= height {
-        vHeight = height
-        currentScrollY = 0
-    }
+	// Calculate the global virtual height for scrolling boundaries.
+	globalVHeight := (currentBlock * blockSize) + vHeight
+	if globalVHeight < height {
+		globalVHeight = height
+	}
 
-    maxScroll := vHeight - height
-    if maxScroll < 0 {
-        maxScroll = 0
-    }
+	// Clamp the global scroll offset within valid bounds.
+	maxScroll := globalVHeight - height
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if currentScrollY > maxScroll {
+		currentScrollY = maxScroll
+	}
+	if currentScrollY < 0 {
+		currentScrollY = 0
+	}
 
-    if currentScrollY > maxScroll {
-        currentScrollY = maxScroll
-    }
-    if currentScrollY < 0 {
-        currentScrollY = 0
-    }
+	screen.Clear()
 
-    if fullscreen {
-        root.SetRect(0, 0, width, vHeight)
-    }
+	// Execute pre-draw hooks if defined.
+	if before != nil {
+		if before(screen) {
+			screen.Show()
+			return a
+		}
+	}
 
-    simScreen.Clear()
-    root.Draw(simScreen)
+	// Copy the visible "viewport" from the simulation screen to the physical terminal.
+	for cy := 0; cy < height; cy++ {
+		globalY := cy + currentScrollY
+		localY := globalY - (currentBlock * blockSize)
+		
+		if localY >= 0 && localY < vHeight {
+			for cx := 0; cx < width; cx++ {
+				mainc, combc, style, _ := simScreen.GetContent(cx, localY)
+				screen.SetContent(cx, cy, mainc, combc, style)
+			}
+		}
+	}
 
-    screen.Clear()
+	// Sync the hardware cursor position, adjusting for the current scroll offset.
+	cursorX, cursorY, cursorVisible := simScreen.GetCursor()
+	if cursorVisible {
+		globalCursorY := cursorY + (currentBlock * blockSize)
+		realCursorY := globalCursorY - currentScrollY
 
-    if before != nil {
-        if before(screen) {
-            screen.Show()
-            return a
-        }
-    }
+		if realCursorY >= 0 && realCursorY < height {
+			screen.ShowCursor(cursorX, realCursorY)
+		} else {
+			screen.HideCursor()
+		}
+	} else {
+		screen.HideCursor()
+	}
 
-    for cy := 0; cy < height; cy++ {
-        virtualY := cy + currentScrollY
-        if virtualY >= vHeight {
-            break
-        }
-        for cx := 0; cx < width; cx++ {
-            mainc, combc, style, _ := simScreen.GetContent(cx, virtualY)
-            screen.SetContent(cx, cy, mainc, combc, style)
-        }
-    }
+	// Execute post-draw hooks if defined.
+	if after != nil {
+		after(screen)
+	}
 
-    cursorX, cursorY, cursorVisible := simScreen.GetCursor()
-    if cursorVisible {
-        realCursorY := cursorY - currentScrollY
-        
-        if realCursorY >= 0 && realCursorY < height {
-            screen.ShowCursor(cursorX, realCursorY)
-        } else {
-            screen.HideCursor()
-        }
-    } else {
-        screen.HideCursor()
-    }
-
-    if after != nil {
-        after(screen)
-    }
-
-    screen.Show()
-    return a
+	// Render the final buffer to the terminal screen.
+	screen.Show()
+	return a
 }
 
 // Sync forces a full re-sync of the screen buffer with the actual screen during
