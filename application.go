@@ -20,6 +20,9 @@ const (
 // double click rather than click.
 var DoubleClickInterval = 500 * time.Millisecond
 
+// currentScrollY is the current vertical scroll position of the application.
+var currentScrollY int
+
 // MouseAction indicates one of the actions the mouse is logically doing.
 type MouseAction int16
 
@@ -396,58 +399,70 @@ EventLoop:
 
 			switch event := event.(type) {
 			case *tcell.EventKey:
-				// If we are pasting, collect runes, nothing else.
-				if pasting {
-					switch event.Key() {
-					case tcell.KeyRune:
-						pasteBuffer.WriteRune(event.Rune())
-					case tcell.KeyEnter:
-						pasteBuffer.WriteRune('\n')
-					case tcell.KeyCtrlJ:
-						pasteBuffer.WriteRune('\n')
-					case tcell.KeyTab:
-						pasteBuffer.WriteRune('\t')
-					}
-					break
-				}
+                // If we are pasting, collect runes, nothing else.
+                if pasting {
+                    switch event.Key() {
+                    case tcell.KeyRune:
+                        pasteBuffer.WriteRune(event.Rune())
+                    case tcell.KeyEnter:
+                        pasteBuffer.WriteRune('\n')
+                    case tcell.KeyCtrlJ:
+                        pasteBuffer.WriteRune('\n')
+                    case tcell.KeyTab:
+                        pasteBuffer.WriteRune('\t')
+                    }
+                    break
+                }
 
-				a.RLock()
-				root := a.root
-				inputCapture := a.inputCapture
-				a.RUnlock()
+                a.RLock()
+                root := a.root
+                inputCapture := a.inputCapture
+                a.RUnlock()
 
-				// Intercept keys.
-				var draw bool
-				originalEvent := event
-				if inputCapture != nil {
-					event = inputCapture(event)
-					if event == nil {
-						a.draw()
-						break // Don't forward event.
-					}
-					draw = true
-				}
+                // Intercept keys.
+                var draw bool
+                originalEvent := event
+                if inputCapture != nil {
+                    event = inputCapture(event)
+                    if event == nil {
+                        a.draw()
+                        break // Don't forward event.
+                    }
+                    draw = true
+                }
 
-				// Ctrl-C closes the application.
-				if event == originalEvent && event.Key() == tcell.KeyCtrlC {
-					a.Stop()
-					break
-				}
+                // Ctrl-C closes the application.
+                if event == originalEvent && event.Key() == tcell.KeyCtrlC {
+                    a.Stop()
+                    break
+                }
 
-				// Pass other key events to the root primitive.
-				if root != nil && root.HasFocus() {
-					if handler := root.InputHandler(); handler != nil {
-						handler(event, func(p Primitive) {
-							a.SetFocus(p)
-						})
-						draw = true
-					}
-				}
+                if event == originalEvent {
+                    if event.Key() == tcell.KeyUp {
+                        currentScrollY--
+                        a.draw()
+                        break
+                    } else if event.Key() == tcell.KeyDown {
+                        currentScrollY++
+                        a.draw()
+                        break
+                    }
+                }
 
-				// Redraw.
-				if draw {
-					a.draw()
-				}
+                // Pass other key events to the root primitive.
+                if root != nil && root.HasFocus() {
+                    if handler := root.InputHandler(); handler != nil {
+                        handler(event, func(p Primitive) {
+                            a.SetFocus(p)
+                        })
+                        draw = true
+                    }
+                }
+
+                // Redraw.
+                if draw {
+                    a.draw()
+                }
 			case *tcell.EventPaste:
 				if !a.enablePaste {
 					break
@@ -473,32 +488,43 @@ EventLoop:
 					}
 				}
 			case *tcell.EventResize:
-				if time.Since(lastRedraw) < redrawPause {
-					if redrawTimer != nil {
-						redrawTimer.Stop()
-					}
-					redrawTimer = time.AfterFunc(redrawPause, func() {
-						a.events <- event
-					})
-				}
-				a.RLock()
-				screen := a.screen
-				a.RUnlock()
-				if screen == nil {
-					break
-				}
-				lastRedraw = time.Now()
-				screen.Clear()
-				a.draw()
-			case *tcell.EventMouse:
-				consumed, isMouseDownAction := a.fireMouseActions(event)
-				if consumed {
-					a.draw()
-				}
-				a.lastMouseButtons = event.Buttons()
-				if isMouseDownAction {
-					a.mouseDownX, a.mouseDownY = event.Position()
-				}
+                if time.Since(lastRedraw) < redrawPause {
+                    if redrawTimer != nil {
+                        redrawTimer.Stop()
+                    }
+                    redrawTimer = time.AfterFunc(redrawPause, func() {
+                        a.events <- event
+                    })
+                }
+                a.RLock()
+                screen := a.screen
+                a.RUnlock()
+                if screen == nil {
+                    break
+                }
+                lastRedraw = time.Now()
+                screen.Clear()
+                a.draw()
+            case *tcell.EventMouse:
+                buttons := event.Buttons()
+                if buttons&tcell.WheelUp != 0 {
+                    currentScrollY--
+                    a.draw()
+                    break 
+                } else if buttons&tcell.WheelDown != 0 {
+                    currentScrollY++
+                    a.draw()
+                    break 
+                }
+
+                consumed, isMouseDownAction := a.fireMouseActions(event)
+                if consumed {
+                    a.draw()
+                }
+                a.lastMouseButtons = event.Buttons()
+                if isMouseDownAction {
+                    a.mouseDownX, a.mouseDownY = event.Position()
+                }
 			case *tcell.EventError:
 				appErr = event
 				a.Stop()
@@ -698,51 +724,134 @@ func (a *Application) ForceDraw() *Application {
 	return a.draw()
 }
 
-// draw actually does what Draw() promises to do.
 func (a *Application) draw() *Application {
-	a.Lock()
-	defer a.Unlock()
+    a.Lock()
+    defer a.Unlock()
 
-	screen := a.screen
-	root := a.root
-	fullscreen := a.rootFullscreen
-	before := a.beforeDraw
-	after := a.afterDraw
+    screen := a.screen
+    root := a.root
+    fullscreen := a.rootFullscreen
+    before := a.beforeDraw
+    after := a.afterDraw
 
-	// Maybe we're not ready yet or not anymore.
-	if screen == nil || root == nil {
-		return a
-	}
+    if screen == nil || root == nil {
+        return a
+    }
 
-	// Resize if requested.
-	if fullscreen { // root is not nil here.
-		width, height := screen.Size()
-		root.SetRect(0, 0, width, height)
-	}
+    width, height := screen.Size()
 
-	// Clear screen to remove unwanted artifacts from the previous cycle.
-	screen.Clear()
+    virtualHeight := height
+    if virtualHeight < 60 { 
+        virtualHeight = 60
+    }
 
-	// Call before handler if there is one.
-	if before != nil {
-		if before(screen) {
-			screen.Show()
-			return a
-		}
-	}
+    if ext, ok := root.(interface{ GetItemCount() int }); ok {
+        virtualHeight = ext.GetItemCount() * 10
+    } else if form, ok := root.(interface{ GetFormItemCount() int }); ok {
+        virtualHeight = 10 + (form.GetFormItemCount() * 3)
+    }
 
-	// Draw all primitives.
-	root.Draw(screen)
+    if virtualHeight < 150 {
+        virtualHeight = 150
+    }
 
-	// Call after handler if there is one.
-	if after != nil {
-		after(screen)
-	}
+    simScreen := tcell.NewSimulationScreen("")
+    simScreen.Init()
+    simScreen.SetSize(width, virtualHeight)
+    simScreen.Clear()
 
-	// Sync screen.
-	screen.Show()
+    if fullscreen {
+        root.SetRect(0, 0, width, virtualHeight)
+    }
+    root.Draw(simScreen)
 
-	return a
+    vHeight := 0
+    _, _, defaultStyle, _ := simScreen.GetContent(0, virtualHeight-1)
+
+    for cy := virtualHeight - 1; cy >= 0; cy-- {
+        rowHasContent := false
+        for cx := 0; cx < width; cx++ {
+            mainc, _, style, _ := simScreen.GetContent(cx, cy)
+            if mainc != 0 && mainc != ' ' && mainc != 0x20 && style != defaultStyle {
+                rowHasContent = true
+                break
+            }
+        }
+        if rowHasContent {
+            vHeight = cy + 1
+            break
+        }
+    }
+
+    if vHeight <= 0 {
+        vHeight = height
+    }
+
+    vHeight += 2
+
+    if vHeight <= height {
+        vHeight = height
+        currentScrollY = 0
+    }
+
+    maxScroll := vHeight - height
+    if maxScroll < 0 {
+        maxScroll = 0
+    }
+
+    if currentScrollY > maxScroll {
+        currentScrollY = maxScroll
+    }
+    if currentScrollY < 0 {
+        currentScrollY = 0
+    }
+
+    if fullscreen {
+        root.SetRect(0, 0, width, vHeight)
+    }
+
+    simScreen.Clear()
+    root.Draw(simScreen)
+
+    screen.Clear()
+
+    if before != nil {
+        if before(screen) {
+            screen.Show()
+            return a
+        }
+    }
+
+    for cy := 0; cy < height; cy++ {
+        virtualY := cy + currentScrollY
+        if virtualY >= vHeight {
+            break
+        }
+        for cx := 0; cx < width; cx++ {
+            mainc, combc, style, _ := simScreen.GetContent(cx, virtualY)
+            screen.SetContent(cx, cy, mainc, combc, style)
+        }
+    }
+
+    cursorX, cursorY, cursorVisible := simScreen.GetCursor()
+    if cursorVisible {
+        realCursorY := cursorY - currentScrollY
+        
+        if realCursorY >= 0 && realCursorY < height {
+            screen.ShowCursor(cursorX, realCursorY)
+        } else {
+            screen.HideCursor()
+        }
+    } else {
+        screen.HideCursor()
+    }
+
+    if after != nil {
+        after(screen)
+    }
+
+    screen.Show()
+    return a
 }
 
 // Sync forces a full re-sync of the screen buffer with the actual screen during
