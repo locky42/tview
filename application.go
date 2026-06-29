@@ -486,6 +486,52 @@ EventLoop:
                             }
                         }
 
+                        if tree, ok := focused.(*TreeView); ok {
+                            currentNode := tree.GetCurrentNode()
+                            
+                            if currentNode == tree.GetRoot() {
+                                // Reset scroll to top if the root node is selected
+                                if currentScrollY != 0 {
+                                    currentScrollY = 0
+                                    draw = true
+                                }
+                            } else {
+                                intIndex := 0
+                                found := false
+                                
+                                // Recursively calculate the index of the current node among visible (expanded) nodes
+                                var countVisible func(*TreeNode)
+                                countVisible = func(n *TreeNode) {
+                                    if found {
+                                        return
+                                    }
+                                    if n == currentNode {
+                                        found = true
+                                        return
+                                    }
+                                    
+                                    // Increment index for each traversed visible node
+                                    intIndex++
+                                    
+                                    // Only traverse children if the current node is expanded
+                                    if n.IsExpanded() {
+                                        for _, child := range n.GetChildren() {
+                                            countVisible(child)
+                                            if found {
+                                                return
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                countVisible(tree.GetRoot())
+
+                                // Adjust the element's Y-coordinate based on its visible position within the tree
+                                elemY = elemY + intIndex
+                                elemHeight = 1
+                            }
+                        }
+
                         // Evaluate viewport boundaries and adjust scroll offset if the element is out of bounds
                         if elemHeight > 0 && currentScrollY != 0 {
                             _, height := a.screen.Size()
@@ -553,25 +599,175 @@ EventLoop:
                 lastRedraw = time.Now()
                 screen.Clear()
                 a.draw()
-            case *tcell.EventMouse:
+			case *tcell.EventMouse:
                 buttons := event.Buttons()
+                
+                isWheel := false
                 if buttons&tcell.WheelUp != 0 {
-                    currentScrollY--
-                    a.draw()
-                    break 
+                    if currentScrollY > 0 {
+                        currentScrollY--
+                        isWheel = true
+                    }
                 } else if buttons&tcell.WheelDown != 0 {
                     currentScrollY++
-                    a.draw()
-                    break 
+                    isWheel = true
                 }
 
+                // Safely retrieve the root primitive under a read lock.
+                a.RLock()
+                root := a.root
+                a.RUnlock()
+
+                // Handle mouse wheel scrolling independently of mouse clicks.
+                if isWheel {
+                    if focused := a.GetFocus(); focused != nil {
+                        
+                        // Handle scrolling inside a TreeView primitive.
+                        if tree, ok := focused.(*TreeView); ok {
+                            // Collect all currently visible (expanded) nodes into a linear slice.
+                            var visibleNodes []*TreeNode
+                            var collect func(*TreeNode)
+                            collect = func(n *TreeNode) {
+                                visibleNodes = append(visibleNodes, n)
+                                if n.IsExpanded() {
+                                    for _, child := range n.GetChildren() {
+                                        collect(child)
+                                    }
+                                }
+                            }
+                            collect(tree.GetRoot())
+
+                            // Map the virtual scroll position to the corresponding visible node index.
+                            targetIndex := currentScrollY
+                            if targetIndex >= len(visibleNodes) {
+                                targetIndex = len(visibleNodes) - 1
+                            }
+                            if targetIndex < 0 {
+                                targetIndex = 0
+                            }
+
+                            // Automatically update the tree selection to match the wheel scroll.
+                            if targetIndex < len(visibleNodes) {
+                                tree.SetCurrentNode(visibleNodes[targetIndex])
+                            }
+                        }
+
+                        // Handle scrolling inside a standard List primitive.
+                        if list, ok := focused.(*List); ok {
+                            targetIndex := currentScrollY
+                            if targetIndex >= list.GetItemCount() {
+                                targetIndex = list.GetItemCount() - 1
+                            }
+                            if targetIndex < 0 {
+                                targetIndex = 0
+                            }
+                            list.SetCurrentItem(targetIndex)
+                        }
+                    }
+                    a.draw()
+                    break // Stop processing since the wheel event is fully handled.
+                }
+
+                // Adjust the physical mouse Y-coordinate to align with the virtual scroll offset.
+                if currentScrollY > 0 {
+                    x, y := event.Position()
+                    event = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
+                }
+
+                // Pass the modified mouse event down to the targeted primitives.
+                var draw bool
                 consumed, isMouseDownAction := a.fireMouseActions(event)
                 if consumed {
-                    a.draw()
+                    draw = true
                 }
+                
                 a.lastMouseButtons = event.Buttons()
                 if isMouseDownAction {
                     a.mouseDownX, a.mouseDownY = event.Position()
+                }
+
+                // Post-click autoscroll adjustment to keep the newly selected element inside the viewport.
+                if root != nil && a.screen != nil {
+                    if focused := a.GetFocus(); focused != nil {
+                        _, elemY, _, elemHeight := focused.GetRect()
+                        currentBlock := currentScrollY / blockSize
+
+                        // Handle viewport bounds for a List primitive.
+                        if list, ok := focused.(*List); ok {
+                            currentItem := list.GetCurrentItem()
+                            if currentItem == 0 {
+                                if currentScrollY != 0 {
+                                    currentScrollY = 0
+                                    draw = true
+                                }
+                            } else {
+                                itemHeight := 1
+                                elemY = elemY + (currentItem * itemHeight)
+                                elemHeight = itemHeight
+                            }
+                        }
+
+                        // Handle viewport bounds for a TreeView primitive.
+                        if tree, ok := focused.(*TreeView); ok {
+                            currentNode := tree.GetCurrentNode()
+                            if currentNode == tree.GetRoot() {
+                                if currentScrollY != 0 {
+                                    currentScrollY = 0
+                                    draw = true
+                                }
+                            } else {
+                                intIndex := 0
+                                found := false
+                                
+                                // Count preceding visible nodes to get the relative row offset.
+                                var countVisible func(*TreeNode)
+                                countVisible = func(n *TreeNode) {
+                                    if found { return }
+                                    if n == currentNode {
+                                        found = true
+                                        return
+                                    }
+                                    intIndex++
+                                    if n.IsExpanded() {
+                                        for _, child := range n.GetChildren() {
+                                            countVisible(child)
+                                            if found { return }
+                                        }
+                                    }
+                                }
+                                countVisible(tree.GetRoot())
+
+                                elemY = elemY + intIndex
+                                elemHeight = 1
+                            }
+                        }
+
+                        // Evaluate screen constraints and shift the virtual scroll offset if necessary.
+                        if elemHeight > 0 {
+                            _, height := a.screen.Size()
+                            globalElemY := elemY + (currentBlock * blockSize)
+                            globalElemBottom := globalElemY + elemHeight
+
+                            if globalElemY < currentScrollY {
+                                currentScrollY = globalElemY
+                                draw = true
+                            } else if globalElemBottom > currentScrollY + height { 
+                                if elemHeight >= height {
+                                    if currentScrollY != globalElemY {
+                                        currentScrollY = globalElemY
+                                        draw = true
+                                    }
+                                } else {
+                                    currentScrollY = globalElemBottom - height
+                                    draw = true
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if draw {
+                    a.draw()
                 }
 			case *tcell.EventError:
 				appErr = event
@@ -1008,54 +1204,85 @@ func (a *Application) ResizeToFullScreen(p Primitive) *Application {
 // parents (including the root). Then Focus will be called on the new
 // [Primitive] and all of its parents (including the root).
 func (a *Application) SetFocus(p Primitive) *Application {
-	a.RLock()
-	root := a.root
-	screen := a.screen
-	a.RUnlock()
+    a.RLock()
+    root := a.root
+    screen := a.screen
+    a.RUnlock()
 
-	// We make a focus chain with some pre-allocated space.
-	chain := make([]Primitive, 0, 10)
+    // We make a focus chain with some pre-allocated space.
+    chain := make([]Primitive, 0, 10)
 
-	// Send blur events along the focus chain.
-	if root != nil && root.focusChain(&chain) {
-		for index, pr := range chain {
-			if index == 0 {
-				pr.Blur()
-			}
-			pr.blurred()
-		}
+    // Send blur events along the focus chain.
+    if root != nil && root.focusChain(&chain) {
+        for index, pr := range chain {
+            if index == 0 {
+                pr.Blur()
+            }
+            pr.blurred()
+        }
 
-		// Hide the cursor. If it's needed, the new focused primitive will show it
-		// again.
-		if screen != nil {
-			screen.HideCursor()
-		}
-	} // At this point, no primitive has focus.
+        // Hide the cursor. If it's needed, the new focused primitive will show it
+        // again.
+        if screen != nil {
+            screen.HideCursor()
+        }
+    } // At this point, no primitive has focus.
 
-	// Focus the new primitive.
-	var delegated bool
-	if p != nil {
-		p.Focus(func(p Primitive) {
-			delegated = true // Avoids multiple focus notifications.
-			a.SetFocus(p)
-		})
-	}
+    // Focus the new primitive.
+    var delegated bool
+    if p != nil {
+        p.Focus(func(p Primitive) {
+            delegated = true // Avoids multiple focus notifications.
+            a.SetFocus(p)
+        })
+    }
 
-	// If the primitive delegated focus to a child, that call has already
-	// notified the focus listeners.
-	if delegated {
-		return a
-	}
+    // If the primitive delegated focus to a child, that call has already
+    // notified the focus listeners.
+    if delegated {
+        return a
+    }
 
-	// Send focus events along the new focus chain.
-	chain = chain[:0]
-	if root != nil && root.focusChain(&chain) {
-		for _, pr := range chain {
-			pr.focused()
-		}
-	}
+    // Send focus events along the new focus chain.
+    chain = chain[:0]
+    if root != nil && root.focusChain(&chain) {
+        for _, pr := range chain {
+            pr.focused()
+        }
+    }
 
-	return a
+    // Calculate autoscroll bounds for the newly focused primitive.
+    // This ensures forms, input fields, and trees stay visible within the viewport.
+    if p != nil && screen != nil {
+        _, elemY, _, elemHeight := p.GetRect()
+        currentBlock := currentScrollY / blockSize
+
+        if elemHeight > 0 {
+            _, height := screen.Size()
+            
+            // Map the primitive's Y-coordinate to the global virtual scroll space.
+            globalElemY := elemY + (currentBlock * blockSize)
+            globalElemBottom := globalElemY + elemHeight
+
+            // If the element is above the current viewport, scroll up to its top edge.
+            if globalElemY < currentScrollY {
+                currentScrollY = globalElemY
+            } else if globalElemBottom > currentScrollY + height {
+                // If the element is below the current viewport, handle scroll down.
+                if elemHeight >= height {
+                    // If the element itself is taller than the screen, snap to its top edge.
+                    if currentScrollY != globalElemY {
+                        currentScrollY = globalElemY
+                    }
+                } else {
+                    // Scroll down just enough to reveal the bottom edge of the element.
+                    currentScrollY = globalElemBottom - height
+                }
+            }
+        }
+    }
+
+    return a
 }
 
 // GetFocus returns the primitive which has the current focus. If none has it,
