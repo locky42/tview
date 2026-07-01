@@ -122,6 +122,14 @@ func (f *Flex) GetItem(index int) Primitive {
 	return f.items[index].Item
 }
 
+// GetFullItem returns the flexItem at the given index, starting with 0 for the
+// first primitive in this container.
+//
+// This function will panic for out of range indices.
+func (f *Flex) GetFullItem(index int) *flexItem {
+	return f.items[index]
+}
+
 // Clear removes all items from the container.
 func (f *Flex) Clear() *Flex {
 	f.items = nil
