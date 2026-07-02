@@ -134,6 +134,13 @@ type Application struct {
 	mouseDownX, mouseDownY  int              // The position of the mouse when its button was last pressed.
 	lastMouseClick          time.Time        // The time when a mouse button was last clicked.
 	lastMouseButtons        tcell.ButtonMask // The last mouse button state.
+
+	// X coordinate from which vertical virtual scrolling is applied.
+	// Cells left of this coordinate are rendered without currentScrollY offset.
+	scrollRegionStartX int
+
+	// Number of bottom rows excluded from virtual scrolling in the scroll region.
+	scrollRegionBottomReserved int
 }
 
 // NewApplication creates and returns a new application.
@@ -147,6 +154,47 @@ func NewApplication() *Application {
 
 func GetCurrentBlock() int {
 	return currentScrollY / blockSize
+}
+
+// SetScrollRegionStartX sets the left edge (inclusive) where vertical virtual
+// scrolling is applied during rendering and mouse coordinate translation.
+// Use 0 to apply scrolling to the entire viewport.
+func (a *Application) SetScrollRegionStartX(x int) *Application {
+	if x < 0 {
+		x = 0
+	}
+	a.Lock()
+	a.scrollRegionStartX = x
+	a.Unlock()
+	return a
+}
+
+// GetScrollRegionStartX returns the configured left edge where virtual
+// scrolling starts.
+func (a *Application) GetScrollRegionStartX() int {
+	a.RLock()
+	defer a.RUnlock()
+	return a.scrollRegionStartX
+}
+
+// SetScrollRegionBottomReserved sets how many bottom rows remain fixed while
+// the scroll region is shifted by currentScrollY.
+func (a *Application) SetScrollRegionBottomReserved(rows int) *Application {
+	if rows < 0 {
+		rows = 0
+	}
+	a.Lock()
+	a.scrollRegionBottomReserved = rows
+	a.Unlock()
+	return a
+}
+
+// GetScrollRegionBottomReserved returns the configured number of fixed bottom
+// rows in the scroll region.
+func (a *Application) GetScrollRegionBottomReserved() int {
+	a.RLock()
+	defer a.RUnlock()
+	return a.scrollRegionBottomReserved
 }
 
 // SetInputCapture sets a function which captures all key events before they are
@@ -447,6 +495,47 @@ EventLoop:
 				// Keep native up/down behavior for widgets like List/TreeView.
 				if event == originalEvent {
 					if focused := a.GetFocus(); focused != nil {
+						elemX, _, _, _ := focused.GetRect()
+						if elemX < a.GetScrollRegionStartX() {
+							goto HandleKeyEventInRoot
+						}
+
+						if form := focusedFormFromRoot(root); form != nil {
+							if dropDown, isDropDown := focused.(*DropDown); isDropDown {
+								if dropDown.open {
+									goto HandleKeyEventInRoot
+								}
+								switch event.Key() {
+								case tcell.KeyUp:
+									if moveFormFocus(form, a, -1) {
+										draw = true
+										goto DrawKeyEvent
+									}
+								case tcell.KeyDown:
+									if moveFormFocus(form, a, 1) {
+										draw = true
+										goto DrawKeyEvent
+									}
+								}
+								goto HandleKeyEventInRoot
+							}
+							if _, isList := focused.(*List); isList {
+								goto HandleKeyEventInRoot
+							}
+							switch event.Key() {
+							case tcell.KeyUp:
+								if moveFormFocus(form, a, -1) {
+									draw = true
+									goto DrawKeyEvent
+								}
+							case tcell.KeyDown:
+								if moveFormFocus(form, a, 1) {
+									draw = true
+									goto DrawKeyEvent
+								}
+							}
+						}
+
 						if _, ok := focused.(*List); !ok {
 							if _, ok := focused.(*TreeView); !ok {
 								if event.Key() == tcell.KeyUp {
@@ -458,6 +547,8 @@ EventLoop:
 						}
 					}
 				}
+
+			HandleKeyEventInRoot:
 
 				// Pass other key events to the root primitive.
 				if root != nil && root.HasFocus() {
@@ -472,6 +563,14 @@ EventLoop:
 				// AUTO-SCROLL TO FOCUSED ELEMENT
 				if root != nil && a.screen != nil {
 					if focused := a.GetFocus(); focused != nil {
+						elemX, elemY, _, elemHeight := focused.GetRect()
+						if elemX < a.GetScrollRegionStartX() {
+							if currentScrollY != 0 {
+								currentScrollY = 0
+								draw = true
+							}
+							goto DrawKeyEvent
+						}
 						if _, ok := focused.(*List); ok {
 							if currentScrollY != 0 {
 								currentScrollY = 0
@@ -488,7 +587,6 @@ EventLoop:
 							goto DrawKeyEvent
 						}
 
-						_, elemY, _, elemHeight := focused.GetRect()
 						// Handle specialized scrolling logic for tview.List components
 						if list, ok := focused.(*List); ok {
 							currentItem := list.GetCurrentItem()
@@ -560,6 +658,10 @@ EventLoop:
 						// Evaluate viewport boundaries and adjust scroll offset if the element is out of bounds.
 						if elemHeight > 0 {
 							_, height := a.screen.Size()
+							height -= a.GetScrollRegionBottomReserved()
+							if height < 1 {
+								height = 1
+							}
 
 							// Coordinates are in the same virtual space as currentScrollY.
 							globalElemY := elemY
@@ -634,6 +736,9 @@ EventLoop:
 				} else if buttons&tcell.WheelDown != 0 {
 					wheelDelta = 1
 				}
+				mouseX, mouseY := event.Position()
+				scrollRegionStartX := a.GetScrollRegionStartX()
+				scrollRegionBottomReserved := a.GetScrollRegionBottomReserved()
 
 				// Safely retrieve the root primitive under a read lock.
 				a.RLock()
@@ -642,7 +747,55 @@ EventLoop:
 
 				// Handle mouse wheel scrolling independently of mouse clicks.
 				if wheelDelta != 0 {
+					_, screenHeight := a.screen.Size()
+					scrollableHeight := screenHeight - scrollRegionBottomReserved
+					if scrollableHeight < 0 {
+						scrollableHeight = 0
+					}
+					if mouseX < scrollRegionStartX || mouseY >= scrollableHeight {
+						break
+					}
 					if focused := a.GetFocus(); focused != nil {
+						if dropDown, isDropDown := focused.(*DropDown); isDropDown {
+							if dropDown.open {
+								// Let opened dropdown handle wheel for option navigation.
+								wheelEvent := event
+								if currentScrollY > 0 {
+									x, y := event.Position()
+									wheelEvent = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
+								}
+								a.fireMouseActions(wheelEvent)
+								a.draw()
+								break
+							}
+
+							if form := focusedFormFromRoot(root); form != nil {
+								if moveFormFocus(form, a, wheelDelta) {
+									a.draw()
+									break
+								}
+							}
+						}
+
+						if _, isList := focused.(*List); isList {
+							// Dropdown popups are List-based. Do not move form focus here.
+							wheelEvent := event
+							if currentScrollY > 0 {
+								x, y := event.Position()
+								wheelEvent = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
+							}
+							a.fireMouseActions(wheelEvent)
+							a.draw()
+							break
+						}
+
+						if form := focusedFormFromRoot(root); form != nil {
+							if moveFormFocus(form, a, wheelDelta) {
+								a.draw()
+								break
+							}
+						}
+
 						if list, ok := focused.(*List); ok {
 							if count := list.GetItemCount(); count > 0 {
 								target := list.GetCurrentItem() + wheelDelta
@@ -687,7 +840,7 @@ EventLoop:
 						wheelEvent = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
 					}
 
-					// Let widgets (List/TreeView/etc.) process wheel natively first.
+					// Let widgets process wheel first but still allow scrolling for form controls.
 					consumed, _ := a.fireMouseActions(wheelEvent)
 					if !consumed {
 						currentScrollY += wheelDelta
@@ -703,7 +856,14 @@ EventLoop:
 				// Adjust the physical mouse Y-coordinate to align with the virtual scroll offset.
 				if currentScrollY > 0 {
 					x, y := event.Position()
-					event = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
+					_, screenHeight := a.screen.Size()
+					scrollableHeight := screenHeight - scrollRegionBottomReserved
+					if scrollableHeight < 0 {
+						scrollableHeight = 0
+					}
+					if x >= scrollRegionStartX && y < scrollableHeight {
+						event = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
+					}
 				}
 
 				// Pass the modified mouse event down to the targeted primitives.
@@ -721,7 +881,14 @@ EventLoop:
 				// Post-click autoscroll adjustment to keep the newly selected element inside the viewport.
 				if root != nil && a.screen != nil {
 					if focused := a.GetFocus(); focused != nil {
-						_, elemY, _, elemHeight := focused.GetRect()
+						elemX, elemY, _, elemHeight := focused.GetRect()
+						if elemX < a.GetScrollRegionStartX() {
+							if currentScrollY != 0 {
+								currentScrollY = 0
+								draw = true
+							}
+							goto DrawMouseEvent
+						}
 						// Handle viewport bounds for a List primitive.
 						if list, ok := focused.(*List); ok {
 							currentItem := list.GetCurrentItem()
@@ -782,6 +949,10 @@ EventLoop:
 						// Evaluate screen constraints and shift the virtual scroll offset if necessary.
 						if elemHeight > 0 {
 							_, height := a.screen.Size()
+							height -= a.GetScrollRegionBottomReserved()
+							if height < 1 {
+								height = 1
+							}
 							globalElemY := elemY
 							globalElemBottom := globalElemY + elemHeight
 
@@ -802,6 +973,8 @@ EventLoop:
 						}
 					}
 				}
+
+			DrawMouseEvent:
 
 				if draw {
 					a.draw()
@@ -1015,6 +1188,8 @@ func (a *Application) draw() *Application {
 	fullscreen := a.rootFullscreen
 	before := a.beforeDraw
 	after := a.afterDraw
+	scrollRegionStartX := a.scrollRegionStartX
+	scrollRegionBottomReserved := a.scrollRegionBottomReserved
 
 	if screen == nil || root == nil {
 		return a
@@ -1022,6 +1197,19 @@ func (a *Application) draw() *Application {
 
 	// Get the physical dimensions of the terminal window.
 	width, height := screen.Size()
+	if scrollRegionStartX < 0 {
+		scrollRegionStartX = 0
+	}
+	if scrollRegionStartX > width {
+		scrollRegionStartX = width
+	}
+	if scrollRegionBottomReserved < 0 {
+		scrollRegionBottomReserved = 0
+	}
+	if scrollRegionBottomReserved > height {
+		scrollRegionBottomReserved = height
+	}
+	scrollableHeight := height - scrollRegionBottomReserved
 
 	// Estimate virtual content height from the currently focused primitive.
 	focused := focusedFromRoot(root)
@@ -1061,9 +1249,6 @@ func (a *Application) draw() *Application {
 			break
 		}
 	}
-
-	// Add padding to safely accommodate the component's bottom border.
-	vHeight += 2
 
 	// Adaptive sizing: stretch to full screen if the content is small,
 	// otherwise clamp it within the current virtual block constraints.
@@ -1110,10 +1295,13 @@ func (a *Application) draw() *Application {
 
 	// Copy the visible "viewport" from the simulation screen to the physical terminal.
 	for cy := 0; cy < height; cy++ {
-		globalY := cy + currentScrollY
+		for cx := 0; cx < width; cx++ {
+			globalY := cy
+			if cx >= scrollRegionStartX && cy < scrollableHeight {
+				globalY = cy + currentScrollY
+			}
 
-		if globalY >= 0 && globalY < vHeight {
-			for cx := 0; cx < width; cx++ {
+			if globalY >= 0 && globalY < vHeight {
 				mainc, combc, style, _ := simScreen.GetContent(cx, globalY)
 				screen.SetContent(cx, cy, mainc, combc, style)
 			}
@@ -1123,7 +1311,10 @@ func (a *Application) draw() *Application {
 	// Sync the hardware cursor position, adjusting for the current scroll offset.
 	cursorX, cursorY, cursorVisible := simScreen.GetCursor()
 	if cursorVisible {
-		realCursorY := cursorY - currentScrollY
+		realCursorY := cursorY
+		if cursorX >= scrollRegionStartX && cursorY >= currentScrollY && cursorY < currentScrollY+scrollableHeight {
+			realCursorY = cursorY - currentScrollY
+		}
 
 		if realCursorY >= 0 && realCursorY < height {
 			screen.ShowCursor(cursorX, realCursorY)
@@ -1161,35 +1352,77 @@ func estimateVirtualHeight(focused Primitive, viewportHeight int) int {
 	if viewportHeight < 1 {
 		return 1
 	}
-
-	const extraPadding = 2
-
-	switch p := focused.(type) {
-	case *List:
-		_ = p
-		return viewportHeight
-
-	case *TreeView:
-		_ = p
-		return viewportHeight
-	}
-
-	return viewportHeight + blockSize
+	_ = focused
+	return viewportHeight
 }
 
-func countVisibleTreeNodes(node *TreeNode) int {
-	if node == nil {
-		return 0
+func focusedFormFromRoot(root Primitive) *Form {
+	if root == nil {
+		return nil
 	}
 
-	count := 1
-	if node.IsExpanded() {
-		for _, child := range node.GetChildren() {
-			count += countVisibleTreeNodes(child)
+	chain := make([]Primitive, 0, 10)
+	if !root.focusChain(&chain) || len(chain) == 0 {
+		return nil
+	}
+
+	for _, p := range chain {
+		if form, ok := p.(*Form); ok {
+			return form
 		}
 	}
 
-	return count
+	return nil
+}
+
+func moveFormFocus(form *Form, app *Application, delta int) bool {
+	if form == nil || app == nil || delta == 0 {
+		return false
+	}
+
+	itemsCount := form.GetFormItemCount()
+	buttonsCount := form.GetButtonCount()
+	total := itemsCount + buttonsCount
+	if total == 0 {
+		return false
+	}
+
+	itemIndex, buttonIndex := form.GetFocusedItemIndex()
+	current := -1
+	if itemIndex >= 0 {
+		current = itemIndex
+	} else if buttonIndex >= 0 {
+		current = itemsCount + buttonIndex
+	}
+
+	next := current
+	for i := 0; i < total; i++ {
+		next += delta
+		if next < 0 {
+			next = total - 1
+		}
+		if next >= total {
+			next = 0
+		}
+
+		if next < itemsCount {
+			if !form.GetFormItem(next).GetDisabled() {
+				form.SetFocus(next)
+				app.SetFocus(form)
+				return true
+			}
+			continue
+		}
+
+		buttonPos := next - itemsCount
+		if buttonPos >= 0 && buttonPos < buttonsCount && !form.GetButton(buttonPos).GetDisabled() {
+			form.SetFocus(next)
+			app.SetFocus(form)
+			return true
+		}
+	}
+
+	return false
 }
 
 // Sync forces a full re-sync of the screen buffer with the actual screen during
