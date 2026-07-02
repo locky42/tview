@@ -444,12 +444,18 @@ EventLoop:
 					break
 				}
 
-				// Intercept arrow keys for custom virtual scrolling before they reach the widget handler.
+				// Keep native up/down behavior for widgets like List/TreeView.
 				if event == originalEvent {
-					if event.Key() == tcell.KeyUp {
-						currentScrollY--
-					} else if event.Key() == tcell.KeyDown {
-						currentScrollY++
+					if focused := a.GetFocus(); focused != nil {
+						if _, ok := focused.(*List); !ok {
+							if _, ok := focused.(*TreeView); !ok {
+								if event.Key() == tcell.KeyUp {
+									currentScrollY--
+								} else if event.Key() == tcell.KeyDown {
+									currentScrollY++
+								}
+							}
+						}
 					}
 				}
 
@@ -466,8 +472,23 @@ EventLoop:
 				// AUTO-SCROLL TO FOCUSED ELEMENT
 				if root != nil && a.screen != nil {
 					if focused := a.GetFocus(); focused != nil {
+						if _, ok := focused.(*List); ok {
+							if currentScrollY != 0 {
+								currentScrollY = 0
+								draw = true
+							}
+							goto DrawKeyEvent
+						}
+
+						if _, ok := focused.(*TreeView); ok {
+							if currentScrollY != 0 {
+								currentScrollY = 0
+								draw = true
+							}
+							goto DrawKeyEvent
+						}
+
 						_, elemY, _, elemHeight := focused.GetRect()
-						currentBlock := GetCurrentBlock() // Get the current block based on the global scroll position.
 						// Handle specialized scrolling logic for tview.List components
 						if list, ok := focused.(*List); ok {
 							currentItem := list.GetCurrentItem()
@@ -536,12 +557,12 @@ EventLoop:
 							}
 						}
 
-						// Evaluate viewport boundaries and adjust scroll offset if the element is out of bounds
-						if elemHeight > 0 && currentScrollY != 0 {
+						// Evaluate viewport boundaries and adjust scroll offset if the element is out of bounds.
+						if elemHeight > 0 {
 							_, height := a.screen.Size()
 
-							// Map local primitive coordinates to the global virtual scroll coordinate system
-							globalElemY := elemY + (currentBlock * blockSize)
+							// Coordinates are in the same virtual space as currentScrollY.
+							globalElemY := elemY
 							globalElemBottom := globalElemY + elemHeight
 
 							// Adjust viewport upwards if the focused element is above the visible area
@@ -557,6 +578,7 @@ EventLoop:
 					}
 				}
 
+			DrawKeyEvent:
 				// Redraw.
 				if draw {
 					a.draw()
@@ -606,15 +628,11 @@ EventLoop:
 			case *tcell.EventMouse:
 				buttons := event.Buttons()
 
-				isWheel := false
+				wheelDelta := 0
 				if buttons&tcell.WheelUp != 0 {
-					if currentScrollY > 0 {
-						currentScrollY--
-						isWheel = true
-					}
+					wheelDelta = -1
 				} else if buttons&tcell.WheelDown != 0 {
-					currentScrollY++
-					isWheel = true
+					wheelDelta = 1
 				}
 
 				// Safely retrieve the root primitive under a read lock.
@@ -623,50 +641,60 @@ EventLoop:
 				a.RUnlock()
 
 				// Handle mouse wheel scrolling independently of mouse clicks.
-				if isWheel {
+				if wheelDelta != 0 {
 					if focused := a.GetFocus(); focused != nil {
+						if list, ok := focused.(*List); ok {
+							if count := list.GetItemCount(); count > 0 {
+								target := list.GetCurrentItem() + wheelDelta
+								if target >= count {
+									target = count - 1
+								}
+								if target < 0 {
+									target = 0
+								}
+								list.SetCurrentItem(target)
 
-						// Handle scrolling inside a TreeView primitive.
-						if tree, ok := focused.(*TreeView); ok {
-							// Collect all currently visible (expanded) nodes into a linear slice.
-							var visibleNodes []*TreeNode
-							var collect func(*TreeNode)
-							collect = func(n *TreeNode) {
-								visibleNodes = append(visibleNodes, n)
-								if n.IsExpanded() {
-									for _, child := range n.GetChildren() {
-										collect(child)
-									}
+								if currentScrollY != 0 {
+									currentScrollY = 0
 								}
 							}
-							collect(tree.GetRoot())
 
-							// Map the virtual scroll position to the corresponding visible node index.
-							targetIndex := currentScrollY
-							if targetIndex >= len(visibleNodes) {
-								targetIndex = len(visibleNodes) - 1
+							if currentScrollY < 0 {
+								currentScrollY = 0
 							}
-							if targetIndex < 0 {
-								targetIndex = 0
-							}
-
-							// Automatically update the tree selection to match the wheel scroll.
-							if targetIndex < len(visibleNodes) {
-								tree.SetCurrentNode(visibleNodes[targetIndex])
-							}
+							a.draw()
+							break // Focused List is handled explicitly.
 						}
 
-						// Handle scrolling inside a standard List primitive.
-						if list, ok := focused.(*List); ok {
-							targetIndex := currentScrollY
-							if targetIndex >= list.GetItemCount() {
-								targetIndex = list.GetItemCount() - 1
+						if _, ok := focused.(*TreeView); ok {
+							wheelEvent := event
+							if currentScrollY > 0 {
+								x, y := event.Position()
+								wheelEvent = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
 							}
-							if targetIndex < 0 {
-								targetIndex = 0
+							a.fireMouseActions(wheelEvent)
+							if currentScrollY != 0 {
+								currentScrollY = 0
 							}
-							list.SetCurrentItem(targetIndex)
+							a.draw()
+							break
 						}
+					}
+
+					wheelEvent := event
+					if currentScrollY > 0 {
+						x, y := event.Position()
+						wheelEvent = tcell.NewEventMouse(x, y+currentScrollY, event.Buttons(), event.Modifiers())
+					}
+
+					// Let widgets (List/TreeView/etc.) process wheel natively first.
+					consumed, _ := a.fireMouseActions(wheelEvent)
+					if !consumed {
+						currentScrollY += wheelDelta
+					}
+
+					if currentScrollY < 0 {
+						currentScrollY = 0
 					}
 					a.draw()
 					break // Stop processing since the wheel event is fully handled.
@@ -694,7 +722,6 @@ EventLoop:
 				if root != nil && a.screen != nil {
 					if focused := a.GetFocus(); focused != nil {
 						_, elemY, _, elemHeight := focused.GetRect()
-						currenyBlock := GetCurrentBlock() // Get the current block based on the global scroll position.
 						// Handle viewport bounds for a List primitive.
 						if list, ok := focused.(*List); ok {
 							currentItem := list.GetCurrentItem()
@@ -705,6 +732,9 @@ EventLoop:
 								}
 							} else {
 								itemHeight := 1
+								if list.GetShowSecondaryText() {
+									itemHeight = 2
+								}
 								elemY = elemY + (currentItem * itemHeight)
 								elemHeight = itemHeight
 							}
@@ -752,7 +782,7 @@ EventLoop:
 						// Evaluate screen constraints and shift the virtual scroll offset if necessary.
 						if elemHeight > 0 {
 							_, height := a.screen.Size()
-							globalElemY := elemY + (currenyBlock * blockSize)
+							globalElemY := elemY
 							globalElemBottom := globalElemY + elemHeight
 
 							if globalElemY < currentScrollY {
@@ -993,11 +1023,9 @@ func (a *Application) draw() *Application {
 	// Get the physical dimensions of the terminal window.
 	width, height := screen.Size()
 
-	// Virtual scrolling configuration using a block-based (paging) approach.
-	currentBlock := GetCurrentBlock() // Determine the current block based on the global scroll position.
-	virtualHeight := blockSize * 2
-
-	// Ensure the virtual buffer is at least as tall as the physical screen.
+	// Estimate virtual content height from the currently focused primitive.
+	focused := focusedFromRoot(root)
+	virtualHeight := estimateVirtualHeight(focused, height)
 	if virtualHeight < height {
 		virtualHeight = height
 	}
@@ -1022,8 +1050,8 @@ func (a *Application) draw() *Application {
 		rowHasContent := false
 		for cx := 0; cx < width; cx++ {
 			mainc, _, style, _ := simScreen.GetContent(cx, cy)
-			// Identify non-empty cells that contain text, controls, or custom styling.
-			if mainc != 0 && mainc != ' ' && mainc != 0x20 && style != defaultStyle {
+			// Treat any non-space rune as content; styled spaces are content as well.
+			if (mainc != 0 && mainc != ' ' && mainc != 0x20) || style != defaultStyle {
 				rowHasContent = true
 				break
 			}
@@ -1054,14 +1082,12 @@ func (a *Application) draw() *Application {
 	simScreen.Clear()
 	root.Draw(simScreen)
 
-	// Calculate the global virtual height for scrolling boundaries.
-	globalVHeight := (currentBlock * blockSize) + vHeight
-	if globalVHeight < height {
-		globalVHeight = height
+	// Clamp scroll offset against actual rendered virtual content height.
+	if vHeight < height {
+		vHeight = height
 	}
 
-	// Clamp the global scroll offset within valid bounds.
-	maxScroll := globalVHeight - height
+	maxScroll := vHeight - height
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -1085,11 +1111,10 @@ func (a *Application) draw() *Application {
 	// Copy the visible "viewport" from the simulation screen to the physical terminal.
 	for cy := 0; cy < height; cy++ {
 		globalY := cy + currentScrollY
-		localY := globalY - (GetCurrentBlock() * blockSize)
 
-		if localY >= 0 && localY < vHeight {
+		if globalY >= 0 && globalY < vHeight {
 			for cx := 0; cx < width; cx++ {
-				mainc, combc, style, _ := simScreen.GetContent(cx, localY)
+				mainc, combc, style, _ := simScreen.GetContent(cx, globalY)
 				screen.SetContent(cx, cy, mainc, combc, style)
 			}
 		}
@@ -1098,8 +1123,7 @@ func (a *Application) draw() *Application {
 	// Sync the hardware cursor position, adjusting for the current scroll offset.
 	cursorX, cursorY, cursorVisible := simScreen.GetCursor()
 	if cursorVisible {
-		globalCursorY := cursorY + (GetCurrentBlock() * blockSize)
-		realCursorY := globalCursorY - currentScrollY
+		realCursorY := cursorY - currentScrollY
 
 		if realCursorY >= 0 && realCursorY < height {
 			screen.ShowCursor(cursorX, realCursorY)
@@ -1118,6 +1142,54 @@ func (a *Application) draw() *Application {
 	// Render the final buffer to the terminal screen.
 	screen.Show()
 	return a
+}
+
+func focusedFromRoot(root Primitive) Primitive {
+	if root == nil {
+		return nil
+	}
+
+	chain := make([]Primitive, 0, 10)
+	if root.focusChain(&chain) && len(chain) > 0 {
+		return chain[0]
+	}
+
+	return nil
+}
+
+func estimateVirtualHeight(focused Primitive, viewportHeight int) int {
+	if viewportHeight < 1 {
+		return 1
+	}
+
+	const extraPadding = 2
+
+	switch p := focused.(type) {
+	case *List:
+		_ = p
+		return viewportHeight
+
+	case *TreeView:
+		_ = p
+		return viewportHeight
+	}
+
+	return viewportHeight + blockSize
+}
+
+func countVisibleTreeNodes(node *TreeNode) int {
+	if node == nil {
+		return 0
+	}
+
+	count := 1
+	if node.IsExpanded() {
+		for _, child := range node.GetChildren() {
+			count += countVisibleTreeNodes(child)
+		}
+	}
+
+	return count
 }
 
 // Sync forces a full re-sync of the screen buffer with the actual screen during
@@ -1266,8 +1338,8 @@ func (a *Application) SetFocus(p Primitive) *Application {
 		if elemHeight > 0 {
 			_, height := screen.Size()
 
-			// Map the primitive's Y-coordinate to the global virtual scroll space.
-			globalElemY := elemY + (GetCurrentBlock() * blockSize)
+			// Coordinates are in the same virtual space as currentScrollY.
+			globalElemY := elemY
 			globalElemBottom := globalElemY + elemHeight
 
 			// If the element is above the current viewport, scroll up to its top edge.
