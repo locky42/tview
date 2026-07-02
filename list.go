@@ -147,6 +147,10 @@ func (l *List) GetCurrentItem() int {
 	return l.currentItem
 }
 
+func (l *List) GetShowSecondaryText() bool {
+	return l.showSecondaryText
+}
+
 // SetOffset sets the number of items to be skipped (vertically) as well as the
 // number of cells skipped horizontally when the list is drawn. Note that one
 // item corresponds to two rows when there are secondary texts. Shortcuts are
